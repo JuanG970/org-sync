@@ -231,10 +231,27 @@ assigned to org-sync-backend."
   "Return the buglist at URL in cache or nil."
     (cdr (assoc url org-sync-cache-alist)))
 
+(defun org-sync-cache-plain (value)
+  "Copy VALUE without Org text properties before serializing the cache."
+  (cond ((stringp value) (substring-no-properties value))
+        ((consp value) (cons (org-sync-cache-plain (car value))
+                             (org-sync-cache-plain (cdr value))))
+        ((vectorp value) (vconcat (mapcar #'org-sync-cache-plain value)))
+        (t value)))
+
 (defun org-sync-write-cache ()
-  "Write Org-sync cache to `org-sync-cache-file'."
-  (with-temp-file org-sync-cache-file
-    (prin1 `(setq org-sync-cache-alist ',org-sync-cache-alist) (current-buffer))))
+  "Write Org-sync cache to `org-sync-cache-file' atomically and privately."
+  (let ((temp (make-temp-file (concat org-sync-cache-file ".tmp-"))))
+    (unwind-protect
+        (progn
+          (with-temp-file temp
+            (prin1 `(setq org-sync-cache-alist
+                          ',(org-sync-cache-plain org-sync-cache-alist))
+                   (current-buffer)))
+          (set-file-modes temp #o600)
+          (rename-file temp org-sync-cache-file t))
+      (when (file-exists-p temp)
+        (delete-file temp)))))
 
 (defun org-sync-load-cache ()
   "Load Org-sync cache from `org-sync-cache-file'."
@@ -424,17 +441,17 @@ Return ELEM if it was added, nil otherwise."
                                (string< (car b) (car a)))))
 
       `(headline
-        (:title ,(concat
-                  title
-                  (when dtime
-                    (concat
-                     " DEADLINE: "
-                     (format-time-string (org-time-stamp-format) dtime))))
+        (:title ,title
                 :level 2
                 :todo-type todo
                 :todo-keyword ,(upcase (symbol-name (org-sync-get-prop :status b))))
         (section
          nil
+         ,@(when dtime
+             (let* ((raw (format-time-string "<%Y-%m-%d %a %H:%M>" dtime))
+                    (stamp (car (org-element-parse-secondary-string
+                                 raw '(timestamp)))))
+               `((planning (:deadline ,stamp)))))
          ,(org-sync-alist-to-property-drawer prop-alist)
          (fixed-width (:value ,(org-sync-get-prop :desc b))))))))
 
@@ -466,13 +483,30 @@ Return ELEM if it was added, nil otherwise."
                       (lambda (x) `(node-property (:key ,(car x) :value ,(cdr x))))
                       alist)))
 
+(defun org-sync-headline-raw-title (h)
+  "Return the literal title text of headline H, excluding its TODO keyword.
+`org-element' splits inline markup and removes Org tags and priorities
+from :title, but those characters are part of a GitHub issue title."
+  (save-excursion
+    (goto-char (org-element-property :begin h))
+    (let* ((line (buffer-substring-no-properties (point) (line-end-position)))
+           (level (org-element-property :level h))
+           (prefix (format "\\`\\*\\{%d\\} " level))
+           (keyword (org-element-property :todo-keyword h)))
+      (unless (string-match prefix line)
+        (error "Cannot read literal Org headline title"))
+      (let ((title (substring line (match-end 0))))
+        (if (and keyword (string-prefix-p (concat keyword " ") title))
+            (substring title (1+ (length keyword)))
+          title)))))
+
 (defun org-sync-headline-to-buglist (h)
   "Return headline H as a buglist."
   (let* ((skip '(:url))
          (alist (org-sync-property-drawer-to-alist
                  (car (org-element-contents
                        (car (org-element-contents h))))))
-         (title (car (org-element-property :title h)))
+         (title (org-sync-headline-raw-title h))
          (url (cdr (assoc "url" alist)))
          (bugs (mapcar
                 'org-sync-headline-to-bug
@@ -497,8 +531,11 @@ Return ELEM if it was added, nil otherwise."
          ;; properties to skip when looking at the PROPERTIES block
          (skip '(:status :title :desc :date-deadline :date-creation :date-modification))
          (status (intern (downcase (or todo-keyword "open"))))
-         (dtime (org-sync-parse-date (org-element-property :deadline h)))
-         (title (car (org-element-property :title h)))
+         (deadline (org-element-property :deadline h))
+         (dtime (when deadline
+                  (org-time-string-to-time
+                   (org-element-property :raw-value deadline))))
+         (title (org-sync-headline-raw-title h))
          (section (org-element-contents (car (org-element-contents h))))
          (headline-alist (org-sync-property-drawer-to-alist
                           (car (org-element-contents h))))
@@ -526,12 +563,7 @@ Return ELEM if it was added, nil otherwise."
          (t
           (setq desc (concat desc (org-element-interpret-data e)))))))
 
-    ;; deadlines can be either on the same line as the headline or
-    ;; on the next one.  org-element doesn't parse it the same way
-    ;; when on the same line, remove DEADLINE tag from title
-    ;; else ignore DEADLINE tag in paragraph
-    (when dtime
-      (setq title (replace-regexp-in-string " DEADLINE: " "" title)))
+    ;; Planning lines carry deadlines; the title is literal issue text.
 
     (setq bug (list
                :status status
@@ -858,7 +890,23 @@ sync again.\n\n")
 
   ;; parse the buffer and find the buglist-looking headlines
   (let* ((local-doc (org-element-parse-buffer))
-         (local-headlines (org-sync-find-buglists local-doc)))
+         (local-headlines (org-sync-find-buglists local-doc))
+         ;; `org-sync-find-buglists' stops at the first repository heading.
+         ;; Scan the whole tree to catch a second URL nested under it.
+         (all-url-headlines
+          (org-element-map local-doc 'headline
+            (lambda (h)
+              (when (org-sync-buglist-headline-p h) h)))))
+
+    ;; The GitHub pilot allows only one issue write per sync.  A buffer
+    ;; containing multiple buglists could otherwise write the first repo and
+    ;; fail on a later one before the Org buffer and cache are persisted.
+    (when (and (cdr all-url-headlines)
+               (cl-some (lambda (h)
+                          (eq (org-sync-get-backend (org-sync-headline-url h))
+                              'org-sync-github-backend))
+                        all-url-headlines))
+      (user-error "Sync one GitHub repository per Org buffer"))
 
     ;; for each of these headlines, convert it to buglist
     (dolist (headline local-headlines)

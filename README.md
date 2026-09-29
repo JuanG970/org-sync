@@ -49,17 +49,55 @@ Org-sync should import the issues from the repo.
 
 *Note*: This is just a test repo, do not use it to report actual bugs.
 
-Now, let's try to add a new issue.  First you have to set a
-user/password to be able to modify the issue remotely.
+Try adding `** OPEN my test issue` under the imported project heading,
+then run `M-x org-sync`. For GitHub writes, use an `auth-source` token
+for `api.github.com` or run `gh auth login`; never put a password or token
+in your Emacs config. Public issue lists can be read without a token;
+private repositories and all writes require authentication. The backend
+sends a bearer token only to the GitHub API host.
 
-Set the variable org-sync-github-auth to like so:
-`(setq org-sync-github-auth '("ostesting" . "thisisostesting42"))`
+The cache holds the baseline for three-way sync. Load it before syncing
+a previously imported file, then persist it after each successful
+import or sync (the package does not save it automatically):
 
-Try to add another issue e.g. insert `** OPEN my test issue`.  You can
-type a description under it if you want.
+```emacs-lisp
+(require 'org-sync-github)
+(org-sync-load-cache)
+;; With a dedicated GitHub mirror buffer open:
+(org-sync)
+(save-buffer)
+(org-sync-write-cache)
+```
 
-The next step is simple, just run `M-x org-sync`.  It synchronizes all
-the buglists in the document.
+Start with one repository and a disposable issue. GitHub Issues are the
+source of truth; keep private notes outside the mirror. The backend
+syncs titles, bodies, OPEN/CLOSED state, assignee and labels, but not
+comments or PR reviews. It excludes PRs returned by GitHub's `/issues`
+endpoint. Updates PATCH changed fields only and stop if a field has
+diverged since the cached version; do not use unattended sync while
+the same issue is being edited elsewhere. Filtered `org-sync-props`
+sync is not supported by this GitHub backend. The underlying `org-sync`
+merge works at issue granularity: simultaneous edits to different fields
+of the same issue can still require manual conflict resolution. Refresh
+before editing when another device has changed an issue. Keep exactly
+one GitHub repository heading per mirror file. This pilot allows only one
+issue write per sync (create or update); pull-only syncs can refresh
+multiple issues. Create labels in GitHub before using them in an Org
+issue; sync will not auto-create labels. GitHub does not provide an
+idempotent create operation: if a POST fails or times out, inspect GitHub
+before retrying to avoid duplicates. Keep the mirror private when issue
+bodies are sensitive. The persistent cache contains copies of them and
+is written atomically with owner-only permissions. Milestone due dates
+appear as Org planning deadlines, but this backend does not push deadline
+or milestone changes back to GitHub.
+
+Run the fork's focused tests with:
+
+```sh
+emacs -Q --batch -L . -L test \
+  -l test/org-sync-cache-test.el -l test/org-sync-github-test.el \
+  -f ert-run-tests-batch-and-exit
+```
 
 ## How to write a new backend
 
