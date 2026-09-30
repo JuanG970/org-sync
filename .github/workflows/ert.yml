@@ -1,0 +1,19 @@
+name: ERT
+
+on:
+  push:
+    branches: [master, "pilot/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  emacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Emacs
+        run: sudo apt-get update && sudo apt-get install -y emacs-nox
+      - name: Test GitHub backend and cache
+        run: emacs -Q --batch -L . -L test -l test/org-sync-cache-test.el -l test/org-sync-github-test.el -f ert-run-tests-batch-and-exit
